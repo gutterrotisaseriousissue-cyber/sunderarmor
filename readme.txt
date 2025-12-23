@@ -11,6 +11,7 @@ fail/miss/dodge/parry
 
 related work
 https://github.com/Horiwix/Sunderstruck
+https://github.com/melbaa/sunderarmor (original work)
 
 credits
 shagu/pfui
