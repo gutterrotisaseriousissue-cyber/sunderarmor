@@ -2,7 +2,6 @@ local function print(msg)
     DEFAULT_CHAT_FRAME:AddMessage(msg)
 end
 
-
 local _G = getfenv(0)
 
 
@@ -186,18 +185,66 @@ local addon_prefix_sunder_cast = 'SACAST'
 
 local sundercounts = {}
 
+-- 1. Register for periodic damage events where debuff applications are logged
 frame:RegisterEvent("CHAT_MSG_ADDON")
+frame:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE")
+frame:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE")
+
 frame:SetScript("OnEvent", function()
-    if event ~= 'CHAT_MSG_ADDON' then return end
-    if arg1 ~= 'SACAST' then return end
+    -- 1. Handle Addon Messages from OTHER warriors
+    if event == 'CHAT_MSG_ADDON' and arg1 == 'SACAST' then
+        local sender = arg4
+        local me = UnitName("player")
 
-    if not sundercounts[arg4] then
-        sundercounts[arg4] = 0
+        -- Only process if the message came from someone else
+        if sender ~= me then
+            if not sundercounts[sender] then sundercounts[sender] = 0 end
+            sundercounts[sender] = sundercounts[sender] + 1
+            print(string.format('%s sundered!', sender))
+        end
+        
+    -- 2. Handle Combat Log for personal accuracy (No printing here)
+    elseif event == "CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE" or 
+           event == "CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE" then
+        
+        -- Use the exact 1.12.1 phrase: "is afflicted by"
+        if string.find(arg1, "is afflicted by Sunder Armor") then
+             local now = GetTime()
+             if lastsunder and (now - lastsunder) < 0.5 then
+                 -- This ensures your internal table stays accurate even if addon msgs lag
+                 local me = UnitName("player")
+                 if not sundercounts[me] then sundercounts[me] = 0 end
+                 -- We don't increment here to avoid triple-counting with maybesunder
+             end
+        end
     end
-
-    sundercounts[arg4] = sundercounts[arg4] + 1
 end)
 
+-- frame:SetScript("OnEvent", function()
+--     -- Handle Addon Messages (Prints "Name sundered!" for you and other warriors)
+--     if event == 'CHAT_MSG_ADDON' and arg1 == 'SACAST' then
+--         if not sundercounts[arg4] then 
+--             sundercounts[arg4] = 0 
+--         end
+--         sundercounts[arg4] = sundercounts[arg4] + 1
+        
+--         -- This line prints the name to your chat frame
+--         print(string.format('%s sundered!', arg4))
+        
+--     -- Handle Combat Log (Keeps the internal counter accurate via timing)
+--     elseif event == "CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE" or 
+--            event == "CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE" then
+        
+--         if string.find(arg1, "is afflicted by Sunder Armor") then
+--              local now = GetTime()
+--              if lastsunder and (now - lastsunder) < 0.5 then
+--                  local caster = UnitName("player")
+--                  if not sundercounts[caster] then sundercounts[caster] = 0 end
+--                  -- We don't print here because the Addon Message above handles it
+--              end
+--         end
+--     end
+-- end)
 
 
 
@@ -308,8 +355,15 @@ local function maybesunder(spell)
 
     lastsunder = GetTime()
 
+    local me = UnitName("player")
+    if not sundercounts[me] then sundercounts[me] = 0 end
+    sundercounts[me] = sundercounts[me] + 1
+
+    -- This sends the hidden message so other warriors' addons see it
     SendAddonMessage(addon_prefix_sunder_cast, 'whatever', "RAID")
-    print('sundered!')
+    
+    -- Use UnitName("player") to correctly print your own name
+    print(string.format('%s sundered!', UnitName("player")))
 end
 
 
@@ -338,21 +392,6 @@ hooksecurefunc("CastSpellByName", function(spell, target)
     maybesunder(spell)
 end, true)
 
-local function dumpcounts()
-    print('sunder counts:')
-
-    local len = 0
-    for k, v in pairs(sundercounts) do
-        print(string.format('%s %s', k, v))
-        len = len + 1
-    end
-
-    if len == 0 then
-        print('no data')
-    end
-
-    print('sunder counts end')
-end
 
 local function resetcounts()
     sundercounts = {}
@@ -360,9 +399,25 @@ local function resetcounts()
 end
 
 
-SLASH_SUNDERCOUNTS1 = "/sundercounts";
-SLASH_SUNDERCOUNTS2 = "/sundercount";
-SlashCmdList["SUNDERCOUNTS"] = dumpcounts
+
+local function dumpcounts()
+    print('sunder counts:')
+    local len = 0
+    for k, v in pairs(sundercounts) do
+        print(string.format('%s %s', k, v))
+        len = len + 1
+    end
+    if len == 0 then
+        print('no data')
+    end
+    print('sunder counts end')
+end
+
+-- 2. Register the slash command (use uppercase for the ID)
+SLASH_SUNDERCOUNT1 = "/sundercount";
+SLASH_SUNDERCOUNT2 = "/sundercounts";
+SlashCmdList["SUNDERCOUNT"] = dumpcounts
+
 
 SLASH_SUNDERRESET1 = "/sunderreset";
 SlashCmdList["SUNDERRESET"] = resetcounts
