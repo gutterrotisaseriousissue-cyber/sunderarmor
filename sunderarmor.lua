@@ -21,6 +21,17 @@ local function rgbhex(r, g, b)
   return string.format("|cff%02x%02x%02x", (r or 1) * 255, (g or 1) * 255, (b or 1) * 255)
 end
 
+local function IsFailure(msg)
+    if not msg then return false end
+    msg = string.lower(msg)
+    if string.find(msg, "miss") or string.find(msg, "parry") or string.find(msg, "dodge") or 
+       string.find(msg, "block") or string.find(msg, "resist") or string.find(msg, "fail") or 
+       string.find(msg, "immune") or string.find(msg, "evade") then
+        return true
+    end
+    return false
+end
+
 -- =============================================================
 -- LIBTIPSCAN
 -- =============================================================
@@ -130,14 +141,13 @@ local sync_timestamps = {}
 local me = UnitName("player")
 local playerEntered = false 
 
--- Player State
+-- State
 local waitingForSunderApply = false
 local pendingSunderTime = 0
-
--- Target State
+local lastSelfSunderTime = 0 -- THROTTLE: Prevents double counts
 local lastTargetState = nil -- 'missing', 'building', 'max'
 
--- Timer State (Per Target)
+-- Timers
 local targetTimers = {} -- Key = Name:Level, Value = ExpiryTime
 local currentTargetKey = nil
 local sunderSoonWarned = false
@@ -151,11 +161,11 @@ frame:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE")
 frame:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE") 
 frame:RegisterEvent("PLAYER_TARGET_CHANGED")
 frame:RegisterEvent("UNIT_AURA")
-frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("SPELLCAST_STOP") -- Used for Silent Maintenance
 
 -- =============================================================
--- HELPER: GET CURRENT TARGET SUNDER STACK
+-- HELPER: GET STACKS & KEY
 -- =============================================================
 local function GetTargetSunderStack()
     if not UnitExists("target") then return 0 end
@@ -168,9 +178,6 @@ local function GetTargetSunderStack()
     return 0
 end
 
--- =============================================================
--- HELPER: GET TARGET KEY (For Timers)
--- =============================================================
 local function GetTargetKey()
     if UnitExists("target") and not UnitIsDead("target") then
         local name = UnitName("target") or "Unknown"
@@ -181,14 +188,14 @@ local function GetTargetKey()
 end
 
 -- =============================================================
--- LOGIC: CHECK TARGET STATUS (Start/Stop)
+-- LOGIC: CHECK TARGET STATUS
 -- =============================================================
 local function CheckTargetSunders(triggerEvent)
     if not playerEntered then return end
     
     if not UnitExists("target") or UnitIsDead("target") or not UnitCanAttack("player", "target") then
         if triggerEvent == "PLAYER_TARGET_CHANGED" then
-            lastTargetState = nil
+             lastTargetState = nil
         end
         currentTargetKey = nil
         return
@@ -197,7 +204,7 @@ local function CheckTargetSunders(triggerEvent)
     currentTargetKey = GetTargetKey()
     local sunderStack = GetTargetSunderStack()
 
-    -- SAFETY: If we swapped to a mob (same Name:Level) that has 0 stacks, clear timer.
+    -- SAFETY: If we swapped to a new mob with 0 stacks, clear old timer
     if sunderStack == 0 and currentTargetKey and targetTimers[currentTargetKey] then
         targetTimers[currentTargetKey] = nil
     end
@@ -215,7 +222,6 @@ local function CheckTargetSunders(triggerEvent)
             print("|cffff0000Stop Sunder|r")
             lastTargetState = 'max'
         else
-            -- For UNIT_AURA, we rely on RegisterSunder for the print order
             if triggerEvent ~= "UNIT_AURA" then
                lastTargetState = 'max'
             end
@@ -228,16 +234,17 @@ local function CheckTargetSunders(triggerEvent)
 end
 
 -- =============================================================
--- HELPER: PROCESS A SUNDER (Print & Count)
+-- HELPER: REGISTER SUNDER
 -- =============================================================
 local function RegisterSunder(casterName)
-    -- 1. COUNT IT
+    -- 1. COUNT
     if not sundercounts[casterName] then sundercounts[casterName] = 0 end
     sundercounts[casterName] = sundercounts[casterName] + 1
     
+    -- 2. DETERMINE STACK
     local stack = GetTargetSunderStack()
     
-    -- Fix "Stack: 0" lag issue
+    -- Lag Fix: If server says 0 but we confirmed a hit, show 1.
     if stack == 0 and UnitExists("target") then
         stack = 1
     end
@@ -256,22 +263,20 @@ local function RegisterSunder(casterName)
             stackMsg = " (Maintenance)" 
         end
         
-        -- TIMER UPDATE
+        -- TIMER RESET
         local key = GetTargetKey()
         if key then
             targetTimers[key] = GetTime() + 30
-            -- RESET WARNING FLAG so it fires again for this new cycle
-            sunderSoonWarned = false 
+            sunderSoonWarned = false -- Reset warning flag
         end
     end
     
     local finalMsg = string.format('%s%s sundered!%s|r', messageColor, casterName, stackMsg)
 
-    -- 2. PRINT SUNDER MESSAGE
+    -- 3. PRINT MESSAGE
     print(finalMsg)
     
-    -- 3. PRINT STOP SUNDER MESSAGE (Red)
-    -- Only if we just hit 5 (Building -> Max). Do NOT print on Maintenance.
+    -- 4. PRINT STOP SUNDER (Red)
     if stack == 5 and not isMaintenance then
         print("|cffff0000Stop Sunder|r")
         lastTargetState = 'max'
@@ -281,29 +286,23 @@ local function RegisterSunder(casterName)
 end
 
 -- =============================================================
--- TIMER UPDATE LOOP (Per Target)
+-- TIMER LOOP
 -- =============================================================
 updateFrame:SetScript("OnUpdate", function()
     if not playerEntered then return end
     
-    -- Check timer for the CURRENT target only
     if currentTargetKey and UnitExists("target") and not UnitIsDead("target") then
         local expiry = targetTimers[currentTargetKey]
-        
         if expiry then
             local remaining = expiry - GetTime()
-            
-            -- Warn at 5 seconds remaining
             if remaining <= 5 and remaining > 0 then
                 if not sunderSoonWarned then
-                    -- Verify stack still exists before warning
                     if GetTargetSunderStack() > 0 then
                         print("|cffffd700Sunder soon|r")
                         sunderSoonWarned = true
                     end
                 end
             elseif remaining <= 0 then
-                -- Expired
                 targetTimers[currentTargetKey] = nil
             end
         end
@@ -313,7 +312,6 @@ end)
 -- =============================================================
 -- EVENT HANDLER
 -- =============================================================
-
 frame:SetScript("OnEvent", function()
     if event == "PLAYER_ENTERING_WORLD" then
         playerEntered = true
@@ -327,39 +325,70 @@ frame:SetScript("OnEvent", function()
             RegisterSunder(sender)
         end
 
-    -- 2. COMBAT LOG: SELF (Loose Matching for Refresh)
+    -- 2. SELF SUNDER: FALLBACK FOR SILENT MAINTENANCE
+    -- Only trigger this if we are ALREADY at 5 stacks.
+    -- This prevents double-counting building stacks (0-4) which have reliable combat logs.
+    elseif event == "SPELLCAST_STOP" then
+        if waitingForSunderApply then
+             if UnitExists("target") and UnitCanAttack("player", "target") then
+                 -- MAINTENANCE CHECK: Only rely on blind SPELLCAST_STOP if stack is 5
+                 if GetTargetSunderStack() == 5 then
+                     -- THROTTLE (0.5s)
+                     if (GetTime() - lastSelfSunderTime) > 0.5 then
+                         lastSelfSunderTime = GetTime()
+                         waitingForSunderApply = false
+                         RegisterSunder(me)
+                         
+                         local channel = nil
+                         if GetNumRaidMembers() > 0 then channel = "RAID"
+                         elseif GetNumPartyMembers() > 0 then channel = "PARTY" end
+                         if channel then
+                             SendAddonMessage(addon_prefix_sunder_cast, "CAST", channel)
+                         end
+                     end
+                 end
+             end
+        end
+
+    -- 3. SELF SUNDER: VISIBLE COMBAT LOG (Building & Visible Maintenance)
     elseif event == "CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE" or 
            event == "CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE" or
            event == "CHAT_MSG_SPELL_SELF_DAMAGE" then
         
-        local isAfflicted = string.find(arg1, "is afflicted by Sunder Armor")
-        local isCast = string.find(arg1, "You cast Sunder Armor")
-        local isPerform = string.find(arg1, "You perform Sunder Armor")
-        
-        -- If we clicked the button (waitingForSunderApply), we accept ANY indication of cast
-        -- OR if we just see "You cast Sunder" (Refreshes often don't trigger waitingForSunderApply perfectly)
-        if (waitingForSunderApply and (GetTime() - pendingSunderTime < 2)) or isCast or isPerform then
-             if isAfflicted or isCast or isPerform then
-                -- Filter out failures
-                if not string.find(arg1, "fail") then
-                    waitingForSunderApply = false
-                    RegisterSunder(me)
-                    
-                    local channel = nil
-                    if GetNumRaidMembers() > 0 then channel = "RAID"
-                    elseif GetNumPartyMembers() > 0 then channel = "PARTY" end
-                    if channel then
-                        SendAddonMessage(addon_prefix_sunder_cast, "CAST", channel)
+        if string.find(arg1, "Sunder Armor") then
+            -- FAILURE CHECK
+            if IsFailure(arg1) then
+                if waitingForSunderApply then waitingForSunderApply = false end
+                return
+            end
+
+            -- SUCCESS KEYWORDS
+            local isAfflicted = string.find(arg1, "is afflicted by")
+            local isCast = string.find(arg1, "You cast") or string.find(arg1, "You perform")
+            local isHit = string.find(arg1, "hits") or string.find(arg1, "crits")
+            
+            if (waitingForSunderApply and (GetTime() - pendingSunderTime < 2)) or isCast then
+                 if isAfflicted or isCast or isHit then
+                    -- THROTTLE (0.5s)
+                    if (GetTime() - lastSelfSunderTime) > 0.5 then
+                        lastSelfSunderTime = GetTime()
+                        waitingForSunderApply = false
+                        RegisterSunder(me)
+                        
+                        local channel = nil
+                        if GetNumRaidMembers() > 0 then channel = "RAID"
+                        elseif GetNumPartyMembers() > 0 then channel = "PARTY" end
+                        if channel then
+                            SendAddonMessage(addon_prefix_sunder_cast, "CAST", channel)
+                        end
                     end
-                end
-             end
+                 end
+            end
         end
 
-    -- 3. COMBAT LOG: OTHERS (Robust External Matching)
+    -- 4. COMBAT LOG: OTHERS
     elseif event == "CHAT_MSG_SPELL_PARTY_DAMAGE" or event == "CHAT_MSG_SPELL_FRIENDLYPLAYER_DAMAGE" then
         local caster = nil
-
-        -- Match "Name casts Sunder Armor" (works with timestamps like [12:00] Name...)
         if string.find(arg1, "casts Sunder Armor") then
             _, _, caster = string.find(arg1, "(.+) casts Sunder Armor")
         elseif string.find(arg1, "performs Sunder Armor") then
@@ -367,7 +396,6 @@ frame:SetScript("OnEvent", function()
         end
 
         if caster and caster ~= me then
-            -- Clean timestamp if present (Simple bracket removal)
             if string.find(caster, "%]") then
                 local _, e = string.find(caster, "%] ")
                 if e then caster = string.sub(caster, e+1) end
@@ -380,12 +408,12 @@ frame:SetScript("OnEvent", function()
             end
         end
 
-    -- 4. TARGET CHANGE
+    -- 5. TARGET CHANGE
     elseif event == "PLAYER_TARGET_CHANGED" then
         sunderSoonWarned = false 
         CheckTargetSunders("PLAYER_TARGET_CHANGED")
 
-    -- 5. AURA UPDATE
+    -- 6. AURA UPDATE
     elseif event == "UNIT_AURA" then
         if arg1 == "target" then
             CheckTargetSunders("UNIT_AURA")
@@ -403,7 +431,6 @@ local function GetSpellCooldownByName(spellName)
             return duration;
         end
         local i = 1
-        -- Safety Break loop
         while i < 1000 do
             local name, spellRank = GetSpellName(i, bookType);
             if not name then break end
@@ -463,23 +490,18 @@ local function maybesunder(spell)
     pendingSunderTime = GetTime()
 end
 
--- Hook UseAction
+-- Hooks
 hooksecurefunc("UseAction", function(slot, target, button)
     scanner:SetAction(slot)
     local spell, rank = scanner:Line(1)
-    local text = GetActionText(slot)
-    if text or not IsCurrentAction(slot) then return end
-    maybesunder(spell)
+    if spell then maybesunder(spell) end
 end, true)
 
--- Hook CastSpell
 hooksecurefunc("CastSpell", function(spellid, bookType)
-    local spell = 'Sunder Armor'
-    if spellidcache[spell] ~= spellid then return end
-    maybesunder(spell)
+    local spellName = GetSpellName(spellid, bookType)
+    if spellName then maybesunder(spellName) end
 end, true)
 
--- Hook CastSpellByName
 hooksecurefunc("CastSpellByName", function(spell, target)
     maybesunder(spell)
 end, true)
@@ -487,7 +509,6 @@ end, true)
 -- =============================================================
 -- COMMANDS
 -- =============================================================
-
 local function resetcounts()
     sundercounts = {}
     print('|cffff0000Sunder counts reset.|r')
