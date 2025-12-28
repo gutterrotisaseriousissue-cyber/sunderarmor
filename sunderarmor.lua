@@ -140,16 +140,18 @@ local sundercounts = {}
 local sync_timestamps = {} 
 local me = UnitName("player")
 local playerEntered = false 
-local isAddonActive = true -- Global Enable/Disable Switch
+local isAddonActive = true
+local isTankMode = false -- Default: False (Syncing Enabled)
 
 -- State
 local waitingForSunderApply = false
 local pendingSunderTime = 0
-local lastSelfSunderTime = 0
-local lastTargetState = nil
+local lastSelfSunderTime = 0 -- THROTTLE
+local lastTargetState = nil -- 'missing', 'building', 'max'
+local isAutoAttacking = false -- Combat trigger tracking
 
 -- Timers
-local targetTimers = {} 
+local targetTimers = {} -- Key = Name:Level, Value = ExpiryTime
 local currentTargetKey = nil
 local sunderSoonWarned = false
 
@@ -165,6 +167,8 @@ frame:RegisterEvent("UNIT_AURA")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("SPELLCAST_STOP") 
+frame:RegisterEvent("PLAYER_ENTER_COMBAT") 
+frame:RegisterEvent("PLAYER_LEAVE_COMBAT") 
 
 -- =============================================================
 -- HELPER: GET STACKS & KEY
@@ -198,6 +202,7 @@ local function CheckTargetSunders(triggerEvent)
     if not UnitExists("target") or UnitIsDead("target") or not UnitCanAttack("player", "target") then
         if triggerEvent == "PLAYER_TARGET_CHANGED" then
              lastTargetState = nil
+             isAutoAttacking = false -- Reset attack expectation
         end
         currentTargetKey = nil
         return
@@ -206,13 +211,15 @@ local function CheckTargetSunders(triggerEvent)
     currentTargetKey = GetTargetKey()
     local sunderStack = GetTargetSunderStack()
 
+    -- SAFETY: If we swapped to a new mob with 0 stacks, clear old timer
     if sunderStack == 0 and currentTargetKey and targetTimers[currentTargetKey] then
         targetTimers[currentTargetKey] = nil
     end
 
     -- 1. START SUNDER (Green)
     if sunderStack == 0 then
-        if lastTargetState ~= 'missing' then
+        -- Only start if we are attacking/in combat with the mob
+        if isAutoAttacking and lastTargetState ~= 'missing' then
             print("|cff00ff00Start Sunder|r")
             lastTargetState = 'missing'
         end
@@ -240,9 +247,11 @@ end
 local function RegisterSunder(casterName)
     if not isAddonActive then return end
 
+    -- 1. COUNT
     if not sundercounts[casterName] then sundercounts[casterName] = 0 end
     sundercounts[casterName] = sundercounts[casterName] + 1
     
+    -- 2. DETERMINE STACK
     local stack = GetTargetSunderStack()
     
     -- Lag Fix: 0 -> 1
@@ -251,30 +260,33 @@ local function RegisterSunder(casterName)
     end
     
     local stackMsg = ""
-    local messageColor = "" 
+    local messageColor = "" -- Default white
     local isMaintenance = false
     
     if UnitExists("target") then
         stackMsg = string.format(" (Stack: %d)", stack)
         
-        -- MAINTENANCE CHECK
+        -- MAINTENANCE CHECK:
         if stack == 5 and lastTargetState == 'max' then
             isMaintenance = true
-            messageColor = "|cffffd700" 
-            stackMsg = " (sunder sustained!)" 
+            messageColor = "|cffffd700" -- Yellow
+            stackMsg = " (Maintenance)" 
         end
         
         -- TIMER RESET
         local key = GetTargetKey()
         if key then
             targetTimers[key] = GetTime() + 30
-            sunderSoonWarned = false 
+            sunderSoonWarned = false -- FORCE RESET warning
         end
     end
     
     local finalMsg = string.format('%s%s sundered!%s|r', messageColor, casterName, stackMsg)
+
+    -- 3. PRINT MESSAGE
     print(finalMsg)
     
+    -- 4. PRINT STOP SUNDER (Red)
     if stack == 5 and not isMaintenance then
         print("|cffff0000Stop Sunder|r")
         lastTargetState = 'max'
@@ -293,6 +305,7 @@ updateFrame:SetScript("OnUpdate", function()
         local expiry = targetTimers[currentTargetKey]
         if expiry then
             local remaining = expiry - GetTime()
+            -- Warn if between 0 and 5 seconds remaining
             if remaining <= 5 and remaining > 0 then
                 if not sunderSoonWarned then
                     if GetTargetSunderStack() > 0 then
@@ -312,7 +325,7 @@ end)
 -- =============================================================
 frame:SetScript("OnEvent", function()
     if event == "PLAYER_LOGIN" then
-        -- CLASS CHECK: Disable if not Warrior
+        -- CLASS CHECK
         local _, class = UnitClass("player")
         if class ~= "WARRIOR" then
             isAddonActive = false
@@ -320,6 +333,7 @@ frame:SetScript("OnEvent", function()
         else
             isAddonActive = true
         end
+        -- TANK MODE: Off by default
 
     elseif event == "PLAYER_ENTERING_WORLD" then
         playerEntered = true
@@ -339,12 +353,21 @@ frame:SetScript("OnEvent", function()
             RegisterSunder(sender)
         end
 
-    -- 2. SELF SUNDER: SILENT MAINTENANCE FALLBACK (Throttle 0.5s)
+    -- 2. COMBAT STATE (For Start Sunder trigger)
+    elseif event == "PLAYER_ENTER_COMBAT" then
+        isAutoAttacking = true
+        CheckTargetSunders("PLAYER_ENTER_COMBAT")
+    
+    elseif event == "PLAYER_LEAVE_COMBAT" then
+        isAutoAttacking = false
+
+    -- 3. SELF SUNDER: FALLBACK FOR SILENT MAINTENANCE
+    -- Only trigger this if we are ALREADY at 5 stacks to prevent double count on build up.
     elseif event == "SPELLCAST_STOP" then
         if waitingForSunderApply then
              if UnitExists("target") and UnitCanAttack("player", "target") then
-                 -- Only use fallback if stack is 5 (Maintenance)
                  if GetTargetSunderStack() == 5 then
+                     -- THROTTLE (0.5s)
                      if (GetTime() - lastSelfSunderTime) > 0.5 then
                          lastSelfSunderTime = GetTime()
                          waitingForSunderApply = false
@@ -353,7 +376,9 @@ frame:SetScript("OnEvent", function()
                          local channel = nil
                          if GetNumRaidMembers() > 0 then channel = "RAID"
                          elseif GetNumPartyMembers() > 0 then channel = "PARTY" end
-                         if channel then
+                         
+                         -- TANK MODE CHECK: Only send if disabled
+                         if channel and not isTankMode then
                              SendAddonMessage(addon_prefix_sunder_cast, "CAST", channel)
                          end
                      end
@@ -361,23 +386,26 @@ frame:SetScript("OnEvent", function()
              end
         end
 
-    -- 3. SELF SUNDER: COMBAT LOG
+    -- 4. SELF SUNDER: VISIBLE COMBAT LOG
     elseif event == "CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE" or 
            event == "CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE" or
            event == "CHAT_MSG_SPELL_SELF_DAMAGE" then
         
         if string.find(arg1, "Sunder Armor") then
+            -- FAILURE CHECK
             if IsFailure(arg1) then
                 if waitingForSunderApply then waitingForSunderApply = false end
                 return
             end
 
+            -- SUCCESS KEYWORDS
             local isAfflicted = string.find(arg1, "is afflicted by")
             local isCast = string.find(arg1, "You cast") or string.find(arg1, "You perform")
             local isHit = string.find(arg1, "hits") or string.find(arg1, "crits")
             
             if (waitingForSunderApply and (GetTime() - pendingSunderTime < 2)) or isCast then
                  if isAfflicted or isCast or isHit then
+                    -- THROTTLE (0.5s)
                     if (GetTime() - lastSelfSunderTime) > 0.5 then
                         lastSelfSunderTime = GetTime()
                         waitingForSunderApply = false
@@ -386,7 +414,9 @@ frame:SetScript("OnEvent", function()
                         local channel = nil
                         if GetNumRaidMembers() > 0 then channel = "RAID"
                         elseif GetNumPartyMembers() > 0 then channel = "PARTY" end
-                        if channel then
+                        
+                        -- TANK MODE CHECK
+                        if channel and not isTankMode then
                             SendAddonMessage(addon_prefix_sunder_cast, "CAST", channel)
                         end
                     end
@@ -394,7 +424,7 @@ frame:SetScript("OnEvent", function()
             end
         end
 
-    -- 4. OTHERS
+    -- 5. OTHERS
     elseif event == "CHAT_MSG_SPELL_PARTY_DAMAGE" or event == "CHAT_MSG_SPELL_FRIENDLYPLAYER_DAMAGE" then
         local caster = nil
         if string.find(arg1, "casts Sunder Armor") then
@@ -416,10 +446,13 @@ frame:SetScript("OnEvent", function()
             end
         end
 
+    -- 6. TARGET CHANGE
     elseif event == "PLAYER_TARGET_CHANGED" then
         sunderSoonWarned = false 
+        isAutoAttacking = false -- Reset on swap
         CheckTargetSunders("PLAYER_TARGET_CHANGED")
 
+    -- 7. AURA UPDATE
     elseif event == "UNIT_AURA" then
         if arg1 == "target" then
             CheckTargetSunders("UNIT_AURA")
@@ -481,7 +514,7 @@ if not _G.hooksecurefunc then
 end
 
 local function maybesunder(spell)
-    if not isAddonActive then return end -- Hook Guard
+    if not isAddonActive then return end
     
     if not spell then return end
     if type(spell) ~= 'string' then return end
@@ -500,10 +533,7 @@ end
 
 -- Hooks
 hooksecurefunc("UseAction", function(slot, target, button)
-    if not isAddonActive then 
-        -- Call original if disabled (handled by hook logic implicitly, but we stop custom logic)
-        return 
-    end
+    if not isAddonActive then return end
     scanner:SetAction(slot)
     local spell, rank = scanner:Line(1)
     if spell then maybesunder(spell) end
@@ -541,7 +571,7 @@ local function dumpcounts()
     print('----------------')
 end
 
--- NEW: Toggle Command
+-- Toggle Addon Active (Global)
 local function toggleAddon()
     isAddonActive = not isAddonActive
     if isAddonActive then
@@ -553,16 +583,28 @@ local function toggleAddon()
     end
 end
 
+-- Toggle Tank Mode (No Sync)
+local function toggleTankMode()
+    isTankMode = not isTankMode
+    if isTankMode then
+        print("|cff00ff00SunderCounter Tank Mode ENABLED (Local Only).|r")
+    else
+        print("|cffff0000SunderCounter Tank Mode DISABLED (Syncing Enabled).|r")
+    end
+end
+
 SLASH_SUNDERCOUNT1 = "/sundercount";
 SlashCmdList["SUNDERCOUNT"] = dumpcounts
 
 SLASH_SUNDERRESET1 = "/sunderreset";
 SlashCmdList["SUNDERRESET"] = resetcounts
 
--- /sunder or /sunder toggle
+-- /sunder to Toggle On/Off
 SLASH_SUNDERTOGGLE1 = "/sunder";
 SlashCmdList["SUNDERTOGGLE"] = function(msg)
-    if msg == "toggle" or msg == "" then
+    if msg == "tank" then
+        toggleTankMode()
+    elseif msg == "toggle" or msg == "" then
         toggleAddon()
     elseif msg == "on" then
         if not isAddonActive then toggleAddon() end
@@ -570,9 +612,14 @@ SlashCmdList["SUNDERTOGGLE"] = function(msg)
         if isAddonActive then toggleAddon() end
     else
         if isAddonActive then
-            print("SunderCounter is |cff00ff00Active|r")
+            local mode = isTankMode and "|cff00ff00Tank Mode|r" or "|cffff0000Standard Mode|r"
+            print("SunderCounter is |cff00ff00Active|r (" .. mode .. ")")
         else
             print("SunderCounter is |cffff0000Disabled|r")
         end
     end
 end
+
+-- /tankmode shortcut
+SLASH_TANKMODE1 = "/tankmode";
+SlashCmdList["TANKMODE"] = toggleTankMode

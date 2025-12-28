@@ -8,9 +8,12 @@ resets the counts you have collected
 /sundertoggle
 both will disable the addon until spam is fixed. (default state is disabled on non warrior classes)
 
+/tankmode
+/sunder tank
+toggles the addon to tank mode which allows you to track your personal sunders without spamming other warriors as a tank.
+
 todo
 low rank sunders
-fix spam prints
 
 related work
 https://github.com/Horiwix/Sunderstruck
