@@ -260,7 +260,7 @@ local function RegisterSunder(casterName)
         if stack == 5 and lastTargetState == 'max' then
             isMaintenance = true
             messageColor = "|cffffd700" -- Yellow
-            stackMsg = " (Maintenance)" 
+            stackMsg = " (sunder maintained!)" 
         end
         
         -- TIMER RESET
